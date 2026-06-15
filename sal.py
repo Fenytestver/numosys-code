@@ -1,5 +1,5 @@
 """
-sal.py — Situational Awareness Layer (SAL)
+sal.py — Situational Awareness Layer (SAL) entrypoint
 Nomusys elder care monitoring system, CT 106
 
 PURPOSE
@@ -9,54 +9,71 @@ enriched Zigbee sensor stream published by Node-RED (topic: zigbee2mqtt/clean),
 recognises meaningful behavioural events, and publishes named situational events
 that the Bayesian engine consumes.
 
-This version recognises two event types:
+STRUCTURE (D20, T-SAL2)
+------------------------
+As of T-SAL2 increment 1, the SAL is split across several files:
+  sal_config.py — configuration constants (MQTT, PostgreSQL, unit, timings)
+  sal_db.py      — all database access
+  sal_state.py   — in-memory state: sensor lists, loaded event library /
+                   thresholds / time bands, the Per-Room State Model, and
+                   the legacy EXIT/ENTRY state
+  sal.py         — this file: startup sequence, MQTT wiring, EXIT/ENTRY
+                   event logic, heartbeat, shutdown
+
+This file currently still recognises two event types:
   EXIT  — the resident has left the apartment
   ENTRY — someone has entered the apartment
+
+This is the lab-phase EXIT/ENTRY logic, left unchanged by increment 1. The
+D20 redesign of EXIT and ARRIVAL (replacing ENTRY) is a later increment
+(sal_exit_arrival.py).
 
 DEPENDENCIES
 ------------
   Runtime: Python 3.11+, paho-mqtt, psycopg2-binary
   MQTT broker : EMQX on CT 102 (192.168.86.52:1883), user 'sal'
   PostgreSQL  : CT 105 (192.168.86.55), database 'audittrail', user 'numosys'
-                Tables used: sensor_state (read — sensor watch list + state restore),
-                             process_log (write — lifecycle events),
-                             residents (read — unit to resident lookup),
-                             resident_presence (read/write — presence status),
-                             presence_log (write — presence status audit trail),
-                             units (read — unit name to id lookup)
 
 DEPLOYMENT
 ----------
   Deployed as a systemd service: sal.service
-  Script location: /opt/sal.py
+  Script location: /opt/sal.py (plus sal_config.py, sal_db.py, sal_state.py
+  in the same directory)
   Start/stop: systemctl start|stop sal
   Logs: journalctl -u sal -f
 
 EXIT EVENT LOGIC
 ----------------
   Trigger : entrance door opens, then closes
-  Confirm : all PIR/presence sensors silent for SILENCE_WINDOW_SEC after door closes
+  Confirm : all PIR sensors silent for SILENCE_WINDOW_SEC after door closes
   Publish : nomusys/situational/{UNIT}  payload: {event, unit, ts}
-  Cancel  : any PIR/presence motion during the silence window cancels the countdown
+  Cancel  : any PIR motion during the silence window cancels the countdown
   On confirm : sets resident_presence.status = 'AWAY_INFERRED'
 
 ENTRY EVENT LOGIC
 -----------------
   Trigger : entrance door opens, then closes
-  Confirm : any PIR/presence sensor fires while the observation window is active
+  Confirm : any PIR sensor fires while the observation window is active
   Publish : nomusys/situational/{UNIT}  payload: {event, unit, ts}
   Cancel  : silence holds for SILENCE_WINDOW_SEC — EXIT is confirmed instead
   On confirm : sets resident_presence.status = 'IN_ROOM'
 
 NOTE: A single observation window (exit_window_active) serves both EXIT and ENTRY.
   EXIT requires silence throughout the window.
-  ENTRY requires any PIR/presence activity within the window.
+  ENTRY requires any PIR activity within the window.
   No separate ENTRY timer or flag is needed — the two events are mutually
   exclusive outcomes of the same window.
 
+⚠️ As of this increment, EXIT/ENTRY confirmation reads only PIR_SENSORS,
+which is now PIR-only (presence sensors have moved to PRESENCE_SENSORS,
+see sal_state.py). This narrows EXIT/ENTRY confirmation to PIR sensors only
+for this increment. The D20 redesign (unit_appears_empty(), using the
+Per-Room State Model and covering both PIR and presence) replaces this
+logic in a later increment.
+
 PRESENCE STATUS RULE
 --------------------
-  Any PIR or presence sensor activity immediately sets resident_presence.status = 'IN_ROOM'
+  Any PIR sensor activity immediately sets resident_presence.status = 'IN_ROOM'
   regardless of whether an observation window is active. This ensures that motion
   detected at any point — including outside a window — is reflected in the resident
   record. EXIT confirmed then overrides this to AWAY_INFERRED when silence is confirmed.
@@ -92,54 +109,14 @@ import threading
 import time
 from datetime import datetime, timezone
 import paho.mqtt.client as mqtt
-import psycopg2
 
-
-# ---------------------------------------------------------------------------
-# CONFIGURATION
-# All environment-specific values live here. To adapt this service to a
-# different unit, broker, or database, only this section needs to change.
-#
-# LAB-PHASE NOTE: In production, ENTRANCE_DOOR and PIR_SENSORS will be
-# populated at startup from the database (sensor_assignments table) rather
-# than hardcoded here. See design §5 — Confirmation Sensor Configuration.
-# This transition depends on T-M1b landing the full v2.0 schema.
-
-MQTT_HOST = '192.168.86.52'   # EMQX broker — CT 102
-MQTT_PORT = 1883
-MQTT_USER = 'sal'
-MQTT_PASS = 'pass1234'
-
-PG_HOST = '192.168.86.55'     # PostgreSQL — CT 105
-PG_DB   = 'audittrail'
-PG_USER = 'numosys'
-PG_PASS = 'pass1234'
-
-# Sensor friendly names as published in the zigbee2mqtt/clean topic.
-# These must match the names assigned in Zigbee2MQTT exactly.
-ENTRANCE_DOOR = '215_Entrance_Door'  # Single string — only one entrance per apartment
-
-# PIR_SENSORS is populated dynamically at startup by load_pir_sensors(), which
-# queries sensor_state for all PIR and Presence sensors assigned to this unit.
-# It is not hardcoded here. To pick up a newly added sensor, restart the service:
-#   systemctl restart sal
-# The list does not refresh while the SAL is running.
-#
-# PRODUCTION NOTE: In production, live reload is triggered via MQTT
-# (nomusys/config/reload/[device]) without a service restart. This depends on
-# T-M1b landing the full v2.0 schema (sensor_assignments table). For the lab
-# phase and pilot, a manual restart on sensor addition is acceptable.
-PIR_SENSORS = []  # Populated at startup by load_pir_sensors()
-
-UNIT = '215'   # Apartment identifier, used in published event payloads
-
-# How long all PIR/presence sensors must remain silent after the door closes
-# before EXIT is confirmed. 30s is appropriate for lab use; increase for production.
-SILENCE_WINDOW_SEC = 30
-
-# Heartbeat interval. The SAL publishes a heartbeat to signal it is alive.
-# A future watchdog process will alert if the heartbeat stops arriving.
-HEARTBEAT_SEC = 30
+import sal_db
+import sal_state
+from sal_config import (
+    MQTT_HOST, MQTT_PORT, MQTT_USER, MQTT_PASS,
+    ENTRANCE_DOOR, UNIT, SILENCE_WINDOW_SEC, HEARTBEAT_SEC,
+)
+from sal_state import state
 
 
 # ---------------------------------------------------------------------------
@@ -150,248 +127,6 @@ HEARTBEAT_SEC = 30
 # ---------------------------------------------------------------------------
 
 STARTUP_TIME = datetime.now(timezone.utc)
-
-
-# ---------------------------------------------------------------------------
-# IN-MEMORY STATE
-# The SAL maintains a small amount of live state between MQTT messages.
-# This is not persisted — it is rebuilt from sensor_state on every startup.
-# ---------------------------------------------------------------------------
-
-state = {
-    'door_open': False,            # True if the entrance door is currently open
-    'exit_window_active': False,   # True if we are in the observation window after a door
-                                   # close. Used to gate both EXIT confirmation (silence)
-                                   # and ENTRY confirmation (PIR fires). A single flag
-                                   # serves both — the two windows are always started and
-                                   # cancelled together.
-    'exit_window_timer': None,     # Reference to the active threading.Timer, if any
-    'pir_last_seen': {},           # {device_name: datetime} — last motion timestamp per PIR
-    'presence_status': None,       # Last value written to residents.presence_status.
-                                   # Populated at startup from the database.
-                                   # Writes are skipped when the new value matches this.
-}
-
-
-# ---------------------------------------------------------------------------
-# DATABASE HELPERS
-# A fresh connection is opened for each write operation. This is intentional:
-# the SAL writes infrequently and a persistent connection would require
-# keepalive handling. psycopg2 connections are not thread-safe, so opening
-# per-call is the safest pattern here.
-# ---------------------------------------------------------------------------
-
-def get_db():
-    """Open and return a new PostgreSQL connection."""
-    return psycopg2.connect(
-        host=PG_HOST, dbname=PG_DB,
-        user=PG_USER, password=PG_PASS
-    )
-
-
-def log_process_event(event_type, notes=None):
-    """
-    Write a lifecycle event to the process_log table.
-
-    Valid event_type values are defined by the CHECK constraint on the table:
-      startup_clean, startup_after_crash, shutdown_clean, heartbeat_missed
-
-    Failures are printed but not raised — a logging failure must never crash
-    the SAL itself.
-    """
-    try:
-        db = get_db()
-        cur = db.cursor()
-        cur.execute(
-            'INSERT INTO process_log (process_name, event_type, notes)'
-            ' VALUES (%s, %s, %s)',
-            ('sal', event_type, notes)
-        )
-        db.commit()
-        db.close()
-        print(f'process_log: {event_type}')
-    except Exception as e:
-        print(f'process_log error: {e}')
-
-
-def set_presence_status(status):
-    """
-    Write presence status to resident_presence for this unit, and append a
-    row to presence_log for audit continuity.
-
-    Valid values: 'IN_ROOM', 'AWAY_INFERRED'.
-    Skips the database write if the status has not changed since the last
-    write — avoids constant database traffic from repeated PIR firings when
-    the unit is already IN_ROOM.
-    Failures are printed but not raised — a database failure must never
-    crash the SAL itself.
-    """
-    if state['presence_status'] == status:
-        return  # No change — skip the write
-    try:
-        db = get_db()
-        cur = db.cursor()
-        # Get resident_id for this unit
-        cur.execute(
-            'SELECT r.id FROM residents r'
-            ' WHERE r.unit_id = (SELECT id FROM units WHERE unit_name = %s)'
-            '   AND r.status = %s',
-            (UNIT, 'Active')
-        )
-        row = cur.fetchone()
-        if not row:
-            print(f'presence_status: no Active resident found for unit {UNIT}')
-            db.close()
-            return
-        resident_id = row[0]
-        previous_status = state['presence_status'] or 'IN_ROOM'
-        # Update resident_presence
-        cur.execute(
-            'UPDATE resident_presence'
-            ' SET status = %s, set_by = %s, set_at = NOW(), updated_at = NOW()'
-            ' WHERE resident_id = %s',
-            (status, 'system:SAL', resident_id)
-        )
-        # Append to presence_log
-        cur.execute(
-            'INSERT INTO presence_log (resident_id, status, previous_status, set_by, set_at)'
-            ' VALUES (%s, %s, %s, %s, NOW())',
-            (resident_id, status, previous_status, 'system:SAL')
-        )
-        db.commit()
-        db.close()
-        state['presence_status'] = status
-        print(f'presence_status → {status}')
-    except Exception as e:
-        print(f'presence_status error: {e}')
-
-
-def load_pir_sensors():
-    """
-    Build the PIR_SENSORS watch list from sensor_state at startup.
-
-    Queries sensor_state for all PIR and Presence sensors belonging to this
-    unit. The result is stored in the global PIR_SENSORS list and held in
-    memory for the lifetime of this process.
-
-    SCALING NOTE: The SAL runs as one process per unit. 200 units = 200 SAL
-    processes, each responsible for exactly one unit's sensors. This is the
-    intended architecture. Each process is lightweight — a small watch list
-    and a handful of timestamps. One process per unit also means a crash in
-    one unit's SAL does not affect any other unit.
-
-    REFRESH: The list is loaded once at startup. Adding a new sensor to the
-    unit requires a service restart to be picked up:
-      systemctl restart sal
-    In production, MQTT-based live reload (nomusys/config/reload/[device])
-    will handle this without a restart — depends on T-M1b.
-    """
-    global PIR_SENSORS
-    try:
-        db = get_db()
-        cur = db.cursor()
-        cur.execute(
-            'SELECT device FROM sensor_state'
-            ' WHERE unit_id = (SELECT id FROM units WHERE unit_name = %s)'
-            '   AND type IN (%s, %s)',
-            (UNIT, 'PIR', 'Presence')
-        )
-        rows = cur.fetchall()
-        db.close()
-        PIR_SENSORS = [row[0] for row in rows]
-        print(f'PIR/Presence sensors loaded: {PIR_SENSORS}')
-    except Exception as e:
-        print(f'load_pir_sensors error: {e}')
-        PIR_SENSORS = []
-
-
-# ---------------------------------------------------------------------------
-# STARTUP TYPE DETECTION
-
-def get_startup_type():
-    """
-    Determine whether this startup is clean or follows a crash.
-
-    Reads the most recent process_log entry for this process. If it was a
-    clean shutdown, this is a clean start. Any other last state — including
-    no prior record at all — is treated as startup_after_crash, which is the
-    conservative default.
-    """
-    try:
-        db = get_db()
-        cur = db.cursor()
-        cur.execute(
-            'SELECT event_type FROM process_log'
-            ' WHERE process_name = %s'
-            ' ORDER BY event_at DESC LIMIT 1',
-            ('sal',)
-        )
-        row = cur.fetchone()
-        db.close()
-        if row and row[0] == 'shutdown_clean':
-            return 'startup_clean'
-        return 'startup_after_crash'
-    except Exception as e:
-        print(f'startup check error: {e}')
-        return 'startup_after_crash'
-
-
-# ---------------------------------------------------------------------------
-# STATE RESTORATION
-# On startup, the SAL reads the last known sensor values from sensor_state
-# (written continuously by Node-RED) so it does not start blind. Without
-# this, a restart mid-day would cause the SAL to miss events that occurred
-# while it was down, and the first door-close after restart would be
-# misinterpreted because door_open would be False regardless of reality.
-# ---------------------------------------------------------------------------
-
-def restore_state():
-    """
-    Populate in-memory state from the last known sensor values in sensor_state,
-    and load the current presence_status from the residents table.
-
-    Contact sensor convention: last_event_value is stored as the string 'true'
-    or 'false'. contact='false' means the door is OPEN (magnet separated).
-    So door_open = (evt_val == 'false').
-
-    Note: last_seen timestamps for PIR sensors are stored as timezone-aware
-    datetimes by PostgreSQL. The SAL compares these directly against
-    datetime.now(timezone.utc) in all_pir_silent(), so timezone consistency
-    is required and is preserved here.
-    """
-    try:
-        db = get_db()
-        cur = db.cursor()
-        cur.execute(
-            'SELECT device, last_event_type, last_event_value, last_seen'
-            ' FROM sensor_state'
-            ' WHERE device = ANY(%s)',
-            ([ENTRANCE_DOOR] + PIR_SENSORS,)
-        )
-        for row in cur.fetchall():
-            device, evt_type, evt_val, last_seen = row
-            if device == ENTRANCE_DOOR:
-                # contact=false means OPEN; contact=true means CLOSED
-                state['door_open'] = (evt_val == 'false')
-            elif device in PIR_SENSORS:
-                state['pir_last_seen'][device] = last_seen
-
-        # Load current presence status so we don't write redundant updates
-        cur.execute(
-            'SELECT rp.status FROM resident_presence rp'
-            ' JOIN residents r ON r.id = rp.resident_id'
-            ' WHERE r.unit_id = (SELECT id FROM units WHERE unit_name = %s)'
-            '   AND r.status = %s',
-            (UNIT, 'Active')
-        )
-        row = cur.fetchone()
-        if row:
-            state['presence_status'] = row[0]
-
-        db.close()
-        print(f'State restored: {state}')
-    except Exception as e:
-        print(f'restore_state error: {e}')
 
 
 # ---------------------------------------------------------------------------
@@ -432,7 +167,7 @@ def confirm_exit(client):
     state['exit_window_timer'] = None
     if all_pir_silent():
         print('EXIT confirmed — publishing')
-        set_presence_status('AWAY_INFERRED')
+        state['presence_status'] = sal_db.set_presence_status(UNIT, 'AWAY_INFERRED', state['presence_status'])
         payload = json.dumps({
             'event': 'EXIT',
             'unit': UNIT,
@@ -481,11 +216,11 @@ def cancel_exit_window(reason='activity detected'):
 
 # ---------------------------------------------------------------------------
 # ENTRY EVENT LOGIC
-# ENTRY is confirmed when any PIR or presence sensor fires while the
-# observation window is active (exit_window_active = True). The same window
-# flag serves both EXIT and ENTRY — EXIT requires silence throughout the
-# window; ENTRY requires any sensor activity within it. No separate ENTRY
-# timer or flag is needed.
+# ENTRY is confirmed when any PIR sensor fires while the observation window
+# is active (exit_window_active = True). The same window flag serves both
+# EXIT and ENTRY — EXIT requires silence throughout the window; ENTRY
+# requires any sensor activity within it. No separate ENTRY timer or flag is
+# needed.
 # ---------------------------------------------------------------------------
 
 def publish_entry(client):
@@ -495,7 +230,7 @@ def publish_entry(client):
     """
     cancel_exit_window('ENTRY confirmed')
     print('ENTRY confirmed — publishing')
-    set_presence_status('IN_ROOM')
+    state['presence_status'] = sal_db.set_presence_status(UNIT, 'IN_ROOM', state['presence_status'])
     payload = json.dumps({
         'event': 'ENTRY',
         'unit': UNIT,
@@ -576,13 +311,13 @@ def on_message(client, userdata, msg):
                 print('Entrance door opened')
                 cancel_exit_window('door reopened')
 
-        elif device in PIR_SENSORS:
+        elif device in sal_state.PIR_SENSORS:
             occupancy = data.get('occupancy') or data.get('presence')
             if occupancy is True:
                 # Motion detected. Update last-seen timestamp and set IN_ROOM.
                 # Any motion always sets IN_ROOM regardless of window state.
                 state['pir_last_seen'][device] = datetime.now(timezone.utc)
-                set_presence_status('IN_ROOM')
+                state['presence_status'] = sal_db.set_presence_status(UNIT, 'IN_ROOM', state['presence_status'])
                 if state['exit_window_active']:
                     # PIR fired during observation window — someone is in the
                     # apartment. Confirm ENTRY and cancel the window.
@@ -620,7 +355,7 @@ def on_shutdown(signum, frame):
     """Handle graceful shutdown. Cancel any active timers before exiting."""
     print('Shutting down cleanly')
     cancel_exit_window()
-    log_process_event('shutdown_clean')
+    sal_db.log_process_event('shutdown_clean')
     sys.exit(0)
 
 
@@ -632,11 +367,21 @@ def on_shutdown(signum, frame):
 signal.signal(signal.SIGTERM, on_shutdown)
 signal.signal(signal.SIGINT, on_shutdown)
 
-# Determine startup type, log it, then restore sensor state from the database
-startup_type = get_startup_type()
-log_process_event(startup_type)
-load_pir_sensors()
-restore_state()
+# Determine startup type and log it
+startup_type = sal_db.get_startup_type()
+sal_db.log_process_event(startup_type)
+
+# D20 startup loading (T-SAL2, increment 1): sensor watch lists, event
+# library, thresholds, time bands — in the order given by the Startup
+# Loading table in nomusys_design.md §5.
+sal_state.load_startup_config(UNIT)
+
+# Per-Room State Model (D20): build/restore from sensor_state.
+sal_state.build_room_state(UNIT)
+
+# Legacy EXIT/ENTRY state restoration (unchanged from previous version,
+# now reading from PIR_SENSORS only — see module docstring).
+sal_state.restore_legacy_state(UNIT)
 
 # Connect to EMQX. Callbacks are registered before connect() so no messages
 # are missed between connection and subscription.
