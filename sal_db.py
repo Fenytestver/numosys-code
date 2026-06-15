@@ -24,7 +24,8 @@ def get_db():
     """Open and return a new PostgreSQL connection."""
     return psycopg2.connect(
         host=PG_HOST, dbname=PG_DB,
-        user=PG_USER, password=PG_PASS
+        user=PG_USER, password=PG_PASS,
+        client_encoding='UTF8'
     )
 
 
