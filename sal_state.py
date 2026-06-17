@@ -13,6 +13,7 @@ This file was split out of sal.py as part of the D20 SAL implementation
 """
 
 import sal_db
+from datetime import datetime, timezone
 from sal_config import ENTRANCE_DOOR
 
 
@@ -48,6 +49,21 @@ state = {
 # Each is a plain list of device name strings.
 PIR_SENSORS = []
 PRESENCE_SENSORS = []
+
+# Device name -> location_id, for the same PIR/presence sensors tracked in
+# ROOM_STATE. Built in build_room_state, from the same query, so it can
+# never go out of sync with what ROOM_STATE was built from. Used by
+# update_room_state (T-SAL2 increment 2) so on_message can find which room
+# a firing sensor belongs to without a database round-trip.
+DEVICE_LOCATION = {}
+
+# Device name -> last known value, True or False, for the same sensors.
+# Needed because the "true always wins" room aggregation rule means a
+# sensor going False can only flip its room to False if every other
+# sensor of that type in the room is also currently False — checking that
+# requires knowing every sibling sensor's current value, not just the one
+# that just fired. Built and kept current alongside DEVICE_LOCATION.
+DEVICE_CURRENT_VALUE = {}
 
 # All active rows from sal_event_library, keyed by event_name.
 EVENT_LIBRARY = {}
@@ -139,6 +155,78 @@ def resolve_time_bands(raw_rows, resident_id, cohort_id):
     return resolved
 
 
+def validate_time_bands():
+    """
+    Startup integrity check (T-SAL2 increment 2): confirm the five loaded
+    TIME_BANDS cover all 24 hours with no gaps and no overlaps, by sorting
+    bands by start_time and checking each one's end_time matches the next
+    one's start_time, wrapping around so the last band's end_time must
+    match the first band's start_time.
+
+    Raises RuntimeError if the check fails. Called once at startup, right
+    after TIME_BANDS is resolved — a misconfigured time-band set is a
+    deployment error, not something the SAL should run with in a degraded
+    state (same principle as D15: a partially-working safety system that
+    looks fully functional is worse than one that is openly down). This
+    also removes any need for current_time_band() to handle a None result
+    downstream — if this check passes, every moment of the day falls
+    inside exactly one band.
+
+    Note: the three-level fall-back (institution -> cohort -> resident)
+    has already been applied by the time TIME_BANDS is populated — this
+    function checks the single resolved set of five bands, not each tier
+    separately.
+    """
+    expected_bands = {'night', 'morning', 'midday', 'afternoon', 'evening'}
+    if set(TIME_BANDS.keys()) != expected_bands:
+        raise RuntimeError(
+            f'TIME_BANDS validation failed: expected bands {expected_bands}, '
+            f'got {set(TIME_BANDS.keys())}'
+        )
+
+    ordered = sorted(TIME_BANDS.items(), key=lambda item: item[1]['start_time'])
+    for i, (band_name, times) in enumerate(ordered):
+        next_band_name, next_times = ordered[(i + 1) % len(ordered)]
+        if times['end_time'] != next_times['start_time']:
+            raise RuntimeError(
+                f'TIME_BANDS validation failed: {band_name} ends at '
+                f'{times["end_time"]} but {next_band_name} starts at '
+                f'{next_times["start_time"]} — gap or overlap detected'
+            )
+    print('Time bands validated: 24-hour coverage, no gaps, no overlaps')
+
+
+def current_time_band():
+    """
+    Return the band_name (from TIME_BANDS) that the current moment falls
+    into. validate_time_bands() runs once at startup and stops the SAL if
+    the five bands don't cleanly cover 24 hours — so by the time this
+    function is ever called, every moment of the day falls inside exactly
+    one band, and a None return should not occur in practice.
+
+    Time bands are wall-clock times for the facility (e.g. 'night' =
+    22:00-06:00 local), not UTC — datetime.now() with no tzinfo argument
+    returns the system's local time, which is correct here since CT 106
+    runs in the facility's local timezone (confirmed: Europe/Budapest).
+
+    A band wraps midnight when start_time > end_time (e.g. night
+    22:00-06:00) — for those, "now" falls inside the band if it's at or
+    after start_time OR before end_time, not between them.
+    """
+    now = datetime.now().time()
+    for band_name, times in TIME_BANDS.items():
+        start = times['start_time']
+        end = times['end_time']
+        if start <= end:
+            if start <= now < end:
+                return band_name
+        else:
+            # Wraps midnight
+            if now >= start or now < end:
+                return band_name
+    return None
+
+
 # ---------------------------------------------------------------------------
 # STARTUP LOADING (D20)
 # Loads, in the order given by the Startup Loading table in
@@ -182,6 +270,10 @@ def load_startup_config(unit):
     )
     print(f'Time bands resolved: {list(TIME_BANDS.keys())}')
 
+    # Startup integrity check (T-SAL2 increment 2) — raises RuntimeError
+    # and stops the SAL if the five bands don't cleanly cover 24 hours.
+    validate_time_bands()
+
 
 # ---------------------------------------------------------------------------
 # PER-ROOM STATE MODEL (D20)
@@ -192,7 +284,10 @@ def load_startup_config(unit):
 
 def build_room_state(unit):
     """
-    Build the Per-Room State Model into ROOM_STATE.
+    Build the Per-Room State Model into ROOM_STATE, and the supporting
+    DEVICE_LOCATION / DEVICE_CURRENT_VALUE maps (T-SAL2 increment 2), from
+    the same query — so all three are always built from the same data and
+    can never disagree with each other.
 
     Every active location gets a room entry, even if no PIR or presence
     sensor is deployed there yet — so a sensor added later (and picked up on
@@ -212,7 +307,7 @@ def build_room_state(unit):
     presence_last_true — that room's presence_last_true stays None unless
     another presence sensor in the room has a recorded False.
     """
-    global ROOM_STATE
+    global ROOM_STATE, DEVICE_LOCATION, DEVICE_CURRENT_VALUE
 
     room_state = {}
     for loc in sal_db.load_locations():
@@ -224,8 +319,15 @@ def build_room_state(unit):
             'pir_last_true': None,
         }
 
+    device_location = {}
+    device_current_value = {}
+
     for row in sal_db.load_room_sensor_state(unit):
         location_id = row['location_id']
+        device = row['device']
+        device_location[device] = location_id
+        device_current_value[device] = (row['last_event_value'] == 'true')
+
         if location_id not in room_state:
             # Sensor is assigned to a location not in the active locations
             # list — shouldn't happen, but don't let it crash startup.
@@ -252,7 +354,100 @@ def build_room_state(unit):
                     room['presence_last_true'] = last_seen
 
     ROOM_STATE = room_state
+    DEVICE_LOCATION = device_location
+    DEVICE_CURRENT_VALUE = device_current_value
     print(f'Per-Room State Model built: {ROOM_STATE}')
+    print(f'Device-location map built: {DEVICE_LOCATION}')
+
+
+def update_room_state(device, value):
+    """
+    Update ROOM_STATE for a single incoming PIR/presence sensor message.
+    Called by on_message for every PIR/presence event (T-SAL2 increment 2).
+
+    value is True or False (the sensor's new reported state).
+
+    Mirrors the same per-field rules build_room_state uses, applied
+    incrementally to one sensor instead of a full rebuild from the
+    database:
+
+    - "true always wins": a sensor reporting True immediately sets its
+      room's *_current to True. A sensor reporting False can only set its
+      room's *_current to False if no sibling sensor of the same type in
+      that room is still True (checked via DEVICE_CURRENT_VALUE) — hence
+      DEVICE_CURRENT_VALUE must be updated for this device before that
+      check is made.
+    - pir_last_true is set to now on every PIR True (discrete event).
+    - presence_last_true is set to now on every presence False (marks the
+      end of a presence period) — not on True, per the same rule
+      build_room_state uses.
+
+    Devices not in DEVICE_LOCATION (not part of the per-room model — e.g.
+    the entrance door) are silently ignored; callers should only call this
+    for PIR/presence devices.
+    """
+    global DEVICE_CURRENT_VALUE
+
+    location_id = DEVICE_LOCATION.get(device)
+    if location_id is None or location_id not in ROOM_STATE:
+        return
+
+    DEVICE_CURRENT_VALUE[device] = value
+    room = ROOM_STATE[location_id]
+    now = datetime.now(timezone.utc)
+
+    if device in PIR_SENSORS:
+        if value:
+            room['pir_current'] = True
+            room['pir_last_true'] = now
+        else:
+            # Only clear to False if every PIR sensor in this room is
+            # also currently False.
+            siblings_true = any(
+                DEVICE_CURRENT_VALUE.get(d, False)
+                for d in PIR_SENSORS
+                if DEVICE_LOCATION.get(d) == location_id
+            )
+            room['pir_current'] = siblings_true
+
+    elif device in PRESENCE_SENSORS:
+        if value:
+            room['presence_current'] = True
+        else:
+            room['presence_last_true'] = now
+            siblings_true = any(
+                DEVICE_CURRENT_VALUE.get(d, False)
+                for d in PRESENCE_SENSORS
+                if DEVICE_LOCATION.get(d) == location_id
+            )
+            room['presence_current'] = siblings_true
+
+
+def unit_appears_empty():
+    """
+    EXIT confirmation check (D20, formerly all_pir_silent()). Returns True
+    if, right now:
+      - every room's pir_last_true is at least exit_confirmation_window_sec
+        seconds old, or None (never fired); AND
+      - every room's presence_current is False.
+
+    exit_confirmation_window_sec is read from EVENT_THRESHOLDS for the
+    current time band — the window can differ by time band even though
+    all five bands are currently set to 120s. current_time_band() is
+    guaranteed non-None by validate_time_bands() at startup.
+    """
+    band = current_time_band()
+    window_sec = EVENT_THRESHOLDS[('EXIT', None)][band]['confirmation_sec']
+    now = datetime.now(timezone.utc)
+
+    for room in ROOM_STATE.values():
+        if room['presence_current']:
+            return False
+        if room['pir_last_true'] is not None:
+            elapsed = (now - room['pir_last_true']).total_seconds()
+            if elapsed < window_sec:
+                return False
+    return True
 
 
 # ---------------------------------------------------------------------------

@@ -207,17 +207,18 @@ def load_current_presence_status(unit):
 
 def load_resident_info(unit):
     """
-    Return {'resident_id': ..., 'cohort_id': ...} for the Active resident of
-    this unit, or None if there is no Active resident.
+    Return {'resident_id': ..., 'cohort_id': ..., 'mobility_classification': ...}
+    for the Active resident of this unit, or None if there is no Active resident.
 
     Used to resolve the three-level fall-back (institution → cohort →
-    resident) for sal_event_thresholds and time_band_definitions.
+    resident) for sal_event_thresholds and time_band_definitions, and to
+    evaluate the Compound EXIT block (mobility_classification).
     """
     try:
         db = get_db()
         cur = db.cursor()
         cur.execute(
-            'SELECT id, cohort_id FROM residents'
+            'SELECT id, cohort_id, mobility_classification FROM residents'
             ' WHERE unit_id = (SELECT id FROM units WHERE unit_name = %s)'
             '   AND status = %s',
             (unit, 'Active')
@@ -226,7 +227,11 @@ def load_resident_info(unit):
         db.close()
         if not row:
             return None
-        return {'resident_id': row[0], 'cohort_id': row[1]}
+        return {
+            'resident_id': row[0],
+            'cohort_id': row[1],
+            'mobility_classification': row[2]
+        }
     except Exception as e:
         print(f'load_resident_info error: {e}')
         return None
@@ -389,3 +394,147 @@ def load_room_sensor_state(unit):
     except Exception as e:
         print(f'load_room_sensor_state error: {e}')
         return []
+
+
+# ---------------------------------------------------------------------------
+# CLINICAL ALERTS (T-SAL2 increment 2)
+# Base + subtype write (alerts + clinical_alerts), per Data model > Alert
+# Architecture. NOTE: publishing to nomusys/alerts/# (T11) is a separate,
+# not-yet-built task — these functions write to PostgreSQL only.
+# ---------------------------------------------------------------------------
+
+def insert_clinical_alert(unit, cohort_id, reason_code, severity):
+    """
+    Raise a new clinical alert for this unit. Looks up alert_reason_id from
+    alert_reason_codes by code, then performs the required atomic
+    two-statement write: INSERT into alerts, then INSERT into
+    clinical_alerts with the same id (see Data model > alerts >
+    clinical_alerts — D17/D18).
+
+    generated_by is always 'situational' here — these are SAL-raised
+    alerts, not Bayesian. bayesian_probability is left NULL, per schema
+    (NULL for situational alerts).
+
+    Returns the new alert id, or None on failure.
+    """
+    try:
+        db = get_db()
+        cur = db.cursor()
+        cur.execute(
+            'SELECT id FROM alert_reason_codes WHERE code = %s',
+            (reason_code,)
+        )
+        row = cur.fetchone()
+        if not row:
+            print(f'insert_clinical_alert error: unknown reason_code {reason_code}')
+            db.close()
+            return None
+        alert_reason_id = row[0]
+
+        cur.execute(
+            'INSERT INTO alerts (alert_class, alert_reason_id, severity)'
+            ' VALUES (%s, %s, %s) RETURNING id',
+            ('clinical', alert_reason_id, severity)
+        )
+        alert_id = cur.fetchone()[0]
+
+        cur.execute(
+            'INSERT INTO clinical_alerts'
+            ' (id, cohort_id, unit_id, bayesian_probability, generated_by)'
+            ' VALUES (%s, %s, (SELECT id FROM units WHERE unit_name = %s), NULL, %s)',
+            (alert_id, cohort_id, unit, 'situational')
+        )
+
+        db.commit()
+        db.close()
+        print(f'Clinical alert raised: {reason_code} ({severity}), id={alert_id}')
+        return alert_id
+    except Exception as e:
+        print(f'insert_clinical_alert error: {e}')
+        return None
+
+
+def find_open_alerts(unit, reason_codes):
+    """
+    Return [{'alert_id': ..., 'reason_code': ...}, ...] for every alert
+    currently status='open' for this unit, matching any of the given
+    reason_codes. Used by ARRIVAL's auto-clear to find which alerts to
+    close (see Event Categories > ARRIVAL — auto-resolves RETURN_OVERDUE
+    and open exit-related alerts).
+
+    self_resolved is reachable only from 'open' (D18) — an alert already
+    acknowledged or pending has a human already engaged with it, and is
+    closed via 'resolved', not auto-clear. So only status='open' rows
+    are eligible here.
+    """
+    try:
+        db = get_db()
+        cur = db.cursor()
+        cur.execute(
+            'SELECT a.id, arc.code'
+            ' FROM alerts a'
+            ' JOIN clinical_alerts ca ON ca.id = a.id'
+            ' JOIN alert_reason_codes arc ON arc.id = a.alert_reason_id'
+            ' WHERE ca.unit_id = (SELECT id FROM units WHERE unit_name = %s)'
+            '   AND a.status = %s'
+            '   AND arc.code = ANY(%s)',
+            (unit, 'open', reason_codes)
+        )
+        rows = cur.fetchall()
+        db.close()
+        return [{'alert_id': r[0], 'reason_code': r[1]} for r in rows]
+    except Exception as e:
+        print(f'find_open_alerts error: {e}')
+        return []
+
+
+def auto_clear_alert(alert_id):
+    """
+    Close an open alert via system auto-clear: write the alert_actions
+    row (action_type='auto_cleared', staff_id=NULL — no human actor,
+    D18) and update alerts.status to 'self_resolved'. Two-statement
+    write in one transaction, same atomicity principle as
+    insert_clinical_alert.
+
+    resolved_at is set here the same as it would be for a staff-resolved
+    alert — it records when the alert stopped being open, regardless of
+    which terminal state it reached.
+
+    Called by ARRIVAL's auto-clear for RETURN_OVERDUE and the exit-related
+    alerts (see find_open_alerts).
+    """
+    try:
+        db = get_db()
+        cur = db.cursor()
+        cur.execute(
+            'SELECT id FROM alert_action_types WHERE type_name = %s',
+            ('auto_cleared',)
+        )
+        row = cur.fetchone()
+        if not row:
+            print('auto_clear_alert error: auto_cleared action type not found')
+            db.close()
+            return False
+        action_type_id = row[0]
+
+        cur.execute(
+            'UPDATE alerts SET status = %s, status_since = NOW(),'
+            ' resolved_at = NOW() WHERE id = %s',
+            ('self_resolved', alert_id)
+        )
+
+        cur.execute(
+            'INSERT INTO alert_actions'
+            ' (alert_id, action_type_id, staff_id, alert_status_after)'
+            ' VALUES (%s, %s, NULL, %s)',
+            (alert_id, action_type_id, 'self_resolved')
+        )
+
+        db.commit()
+        db.close()
+        print(f'Alert auto-cleared: id={alert_id}')
+        return True
+    except Exception as e:
+        print(f'auto_clear_alert error: {e}')
+        return False
+
