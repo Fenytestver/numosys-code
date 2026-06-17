@@ -113,7 +113,7 @@ import sal_state
 import sal_exit_arrival
 from sal_config import (
     MQTT_HOST, MQTT_PORT, MQTT_USER, MQTT_PASS,
-    ENTRANCE_DOOR, UNIT, SILENCE_WINDOW_SEC, HEARTBEAT_SEC,
+    ENTRANCE_DOOR, UNIT, HEARTBEAT_SEC,
 )
 from sal_state import state
 
