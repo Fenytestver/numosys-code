@@ -538,3 +538,56 @@ def auto_clear_alert(alert_id):
         print(f'auto_clear_alert error: {e}')
         return False
 
+
+def insert_technical_alert(unit, reason_code, severity, device=None):
+    """
+    Raise a new technical alert for this unit. Same shape as
+    insert_clinical_alert — looks up alert_reason_id from
+    alert_reason_codes by code, then performs the required atomic
+    two-statement write: INSERT into alerts, then INSERT into
+    technical_alerts with the same id.
+
+    device is optional (technical_alerts.device is nullable as of this
+    session — see nomusys_design.md, technical_alerts table note). Used
+    for the SAL's own technical alerts, which are not tied to a single
+    failing sensor (e.g. resident_data_missing) — every previous
+    technical alert came from the threshold layer and always had a
+    device; this is the first one raised by the SAL itself.
+
+    Returns the new alert id, or None on failure.
+    """
+    try:
+        db = get_db()
+        cur = db.cursor()
+        cur.execute(
+            'SELECT id FROM alert_reason_codes WHERE code = %s',
+            (reason_code,)
+        )
+        row = cur.fetchone()
+        if not row:
+            print(f'insert_technical_alert error: unknown reason_code {reason_code}')
+            db.close()
+            return None
+        alert_reason_id = row[0]
+
+        cur.execute(
+            'INSERT INTO alerts (alert_class, alert_reason_id, severity)'
+            ' VALUES (%s, %s, %s) RETURNING id',
+            ('technical', alert_reason_id, severity)
+        )
+        alert_id = cur.fetchone()[0]
+
+        cur.execute(
+            'INSERT INTO technical_alerts (id, device, unit_id)'
+            ' VALUES (%s, %s, (SELECT id FROM units WHERE unit_name = %s))',
+            (alert_id, device, unit)
+        )
+
+        db.commit()
+        db.close()
+        print(f'Technical alert raised: {reason_code} ({severity}), id={alert_id}')
+        return alert_id
+    except Exception as e:
+        print(f'insert_technical_alert error: {e}')
+        return None
+

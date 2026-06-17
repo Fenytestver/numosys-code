@@ -11,22 +11,27 @@ that the Bayesian engine consumes.
 
 STRUCTURE (D20, T-SAL2)
 ------------------------
-As of T-SAL2 increment 1, the SAL is split across several files:
-  sal_config.py — configuration constants (MQTT, PostgreSQL, unit, timings)
-  sal_db.py      — all database access
-  sal_state.py   — in-memory state: sensor lists, loaded event library /
-                   thresholds / time bands, the Per-Room State Model, and
-                   the legacy EXIT/ENTRY state
-  sal.py         — this file: startup sequence, MQTT wiring, EXIT/ENTRY
-                   event logic, heartbeat, shutdown
+As of T-SAL2 increment 2, the SAL is split across several files:
+  sal_config.py       — configuration constants (MQTT, PostgreSQL, unit, timings)
+  sal_db.py            — all database access
+  sal_state.py         — in-memory state: sensor lists, loaded event library /
+                          thresholds / time bands, the Per-Room State Model,
+                          time-band lookup, and legacy door/presence state
+  sal_exit_arrival.py  — EXIT and ARRIVAL recognition (D20): the confirmation
+                          window, unit_appears_empty() check, the compound EXIT
+                          evaluation, and ARRIVAL recognition via
+                          write_presence_status
+  sal.py               — this file: startup sequence, MQTT wiring, heartbeat,
+                          shutdown. on_message routes door messages to
+                          sal_exit_arrival's window functions and PIR/presence
+                          messages to sal_state.update_room_state plus
+                          sal_exit_arrival.write_presence_status.
 
-This file currently still recognises two event types:
-  EXIT  — the resident has left the apartment
-  ENTRY — someone has entered the apartment
-
-This is the lab-phase EXIT/ENTRY logic, left unchanged by increment 1. The
-D20 redesign of EXIT and ARRIVAL (replacing ENTRY) is a later increment
-(sal_exit_arrival.py).
+This file recognises two event types, both via sal_exit_arrival.py:
+  EXIT     — the resident has left the apartment
+  ARRIVAL  — the resident (or anyone) has returned, recognised as the specific
+             state transition AWAY_INFERRED -> IN_ROOM (D20; replaces the
+             previous lab-phase ENTRY, which was a door-sequence event).
 
 DEPENDENCIES
 ------------
@@ -37,46 +42,39 @@ DEPENDENCIES
 DEPLOYMENT
 ----------
   Deployed as a systemd service: sal.service
-  Script location: /opt/sal.py (plus sal_config.py, sal_db.py, sal_state.py
-  in the same directory)
+  Script location: /opt/sal/sal.py (plus sal_config.py, sal_db.py, sal_state.py,
+  sal_exit_arrival.py in the same directory)
   Start/stop: systemctl start|stop sal
   Logs: journalctl -u sal -f
 
-EXIT EVENT LOGIC
-----------------
+EXIT EVENT LOGIC (D20 — see sal_exit_arrival.py)
+-------------------------------------------------
   Trigger : entrance door opens, then closes
-  Confirm : all PIR sensors silent for SILENCE_WINDOW_SEC after door closes
+  Confirm : sal_state.unit_appears_empty() holds for the full confirmation
+            window — every room's PIR has been silent long enough AND every
+            room's presence_current is False (Per-Room State Model, both PIR
+            and presence sensors, not PIR alone)
   Publish : nomusys/situational/{UNIT}  payload: {event, unit, ts}
-  Cancel  : any PIR motion during the silence window cancels the countdown
-  On confirm : sets resident_presence.status = 'AWAY_INFERRED'
+  Cancel  : the door reopening cancels the window
+  On confirm : sets resident_presence.status = 'AWAY_INFERRED', then runs the
+               Compound EXIT Evaluation (mobility classification + time band)
 
-ENTRY EVENT LOGIC
------------------
-  Trigger : entrance door opens, then closes
-  Confirm : any PIR sensor fires while the observation window is active
+ARRIVAL EVENT LOGIC (D20 — see sal_exit_arrival.py)
+------------------------------------------------------
+  Trigger : none of its own — recognised inside write_presence_status as the
+            specific transition resident_presence.status: AWAY_INFERRED -> IN_ROOM
+  Caused by : any PIR or presence sensor reporting True, at any time — no
+              window, no confirmation sensor set, no door sequence required
   Publish : nomusys/situational/{UNIT}  payload: {event, unit, ts}
-  Cancel  : silence holds for SILENCE_WINDOW_SEC — EXIT is confirmed instead
-  On confirm : sets resident_presence.status = 'IN_ROOM'
-
-NOTE: A single observation window (exit_window_active) serves both EXIT and ENTRY.
-  EXIT requires silence throughout the window.
-  ENTRY requires any PIR activity within the window.
-  No separate ENTRY timer or flag is needed — the two events are mutually
-  exclusive outcomes of the same window.
-
-⚠️ As of this increment, EXIT/ENTRY confirmation reads only PIR_SENSORS,
-which is now PIR-only (presence sensors have moved to PRESENCE_SENSORS,
-see sal_state.py). This narrows EXIT/ENTRY confirmation to PIR sensors only
-for this increment. The D20 redesign (unit_appears_empty(), using the
-Per-Room State Model and covering both PIR and presence) replaces this
-logic in a later increment.
+  On confirm : auto-clears RETURN_OVERDUE and the compound EXIT alerts
 
 PRESENCE STATUS RULE
 --------------------
-  Any PIR sensor activity immediately sets resident_presence.status = 'IN_ROOM'
-  regardless of whether an observation window is active. This ensures that motion
-  detected at any point — including outside a window — is reflected in the resident
-  record. EXIT confirmed then overrides this to AWAY_INFERRED when silence is confirmed.
+  Any PIR or presence sensor activity immediately sets
+  resident_presence.status = 'IN_ROOM', via sal_exit_arrival.write_presence_status
+  — which is also where the AWAY_INFERRED -> IN_ROOM transition (ARRIVAL) is
+  recognised. EXIT confirmation overrides this to AWAY_INFERRED separately,
+  through the same function, once the confirmation window passes.
 
 CONTACT SENSOR CONVENTION
 --------------------------
@@ -112,6 +110,7 @@ import paho.mqtt.client as mqtt
 
 import sal_db
 import sal_state
+import sal_exit_arrival
 from sal_config import (
     MQTT_HOST, MQTT_PORT, MQTT_USER, MQTT_PASS,
     ENTRANCE_DOOR, UNIT, SILENCE_WINDOW_SEC, HEARTBEAT_SEC,
@@ -130,113 +129,15 @@ STARTUP_TIME = datetime.now(timezone.utc)
 
 
 # ---------------------------------------------------------------------------
-# EXIT EVENT LOGIC
-# The EXIT sequence is:
-#   1. Entrance door opens       → door_open = True
-#   2. Entrance door closes      → start silence window
-#   3. No PIR motion for SILENCE_WINDOW_SEC → EXIT confirmed, publish to MQTT
-#   Cancellation: any PIR motion during step 3 cancels the countdown.
+# EXIT AND ARRIVAL EVENT LOGIC
+# Moved to sal_exit_arrival.py as part of T-SAL2 increment 2 (D20).
+# start_exit_window, cancel_exit_window, confirm_exit, and the compound
+# EXIT evaluation now live there. ARRIVAL (replacing the old ENTRY) is
+# recognised by sal_exit_arrival.write_presence_status — every write to
+# resident_presence.status in this file goes through that function so
+# the AWAY_INFERRED -> IN_ROOM transition is only ever checked in one
+# place.
 # ---------------------------------------------------------------------------
-
-def all_pir_silent():
-    """
-    Return True if every monitored PIR sensor has been silent for at least
-    SILENCE_WINDOW_SEC seconds.
-
-    A sensor with no recorded last_seen (None) is treated as silent — it has
-    never fired since the SAL started, which is consistent with absence.
-    """
-    now = datetime.now(timezone.utc)
-    for device, last_seen in state['pir_last_seen'].items():
-        if last_seen is not None:
-            elapsed = (now - last_seen).total_seconds()
-            if elapsed < SILENCE_WINDOW_SEC:
-                return False
-    return True
-
-
-def confirm_exit(client):
-    """
-    Called when the silence window timer expires.
-
-    Re-checks PIR silence at the moment of expiry (a motion event could have
-    arrived between the timer firing and this function executing). Only
-    publishes EXIT if all sensors are still silent.
-    """
-    state['exit_window_active'] = False
-    state['exit_window_timer'] = None
-    if all_pir_silent():
-        print('EXIT confirmed — publishing')
-        state['presence_status'] = sal_db.set_presence_status(UNIT, 'AWAY_INFERRED', state['presence_status'])
-        payload = json.dumps({
-            'event': 'EXIT',
-            'unit': UNIT,
-            'ts': datetime.now(timezone.utc).isoformat()
-        })
-        client.publish(f'nomusys/situational/{UNIT}', payload)
-    else:
-        print('EXIT window expired — PIR active, not confirmed')
-
-
-def start_exit_window(client):
-    """
-    Start the silence window countdown after the entrance door closes.
-
-    Guard against double-starting: if a window is already active (e.g. the
-    door was closed, reopened, and closed again quickly), the existing window
-    continues and a new one is not started.
-    """
-    if state['exit_window_active']:
-        return
-    print(f'EXIT window started — {SILENCE_WINDOW_SEC}s')
-    state['exit_window_active'] = True
-    t = threading.Timer(SILENCE_WINDOW_SEC, confirm_exit, args=[client])
-    state['exit_window_timer'] = t
-    t.start()
-
-
-def cancel_exit_window(reason='activity detected'):
-    """
-    Cancel the active silence window countdown.
-
-    Called when PIR motion is detected during the window, or when the entrance
-    door opens again. Accepts a reason string for logging clarity.
-    Only prints if a window was actually active — avoids spurious log entries
-    when called defensively (e.g. on door-open when no window is running).
-    Safe to call when no window is active.
-    """
-    was_active = state['exit_window_active']
-    if state['exit_window_timer']:
-        state['exit_window_timer'].cancel()
-        state['exit_window_timer'] = None
-    state['exit_window_active'] = False
-    if was_active:
-        print(f'EXIT window cancelled — {reason}')
-
-
-# ---------------------------------------------------------------------------
-# ENTRY EVENT LOGIC
-# ENTRY is confirmed when any PIR sensor fires while the observation window
-# is active (exit_window_active = True). The same window flag serves both
-# EXIT and ENTRY — EXIT requires silence throughout the window; ENTRY
-# requires any sensor activity within it. No separate ENTRY timer or flag is
-# needed.
-# ---------------------------------------------------------------------------
-
-def publish_entry(client):
-    """
-    Confirm ENTRY: cancel the observation window, set presence_status, publish.
-    Called immediately when any PIR fires during the observation window.
-    """
-    cancel_exit_window('ENTRY confirmed')
-    print('ENTRY confirmed — publishing')
-    state['presence_status'] = sal_db.set_presence_status(UNIT, 'IN_ROOM', state['presence_status'])
-    payload = json.dumps({
-        'event': 'ENTRY',
-        'unit': UNIT,
-        'ts': datetime.now(timezone.utc).isoformat()
-    })
-    client.publish(f'nomusys/situational/{UNIT}', payload)
 
 
 # ---------------------------------------------------------------------------
@@ -261,7 +162,7 @@ def on_message(client, userdata, msg):
     The clean topic carries enriched, normalised sensor messages published by
     the Node-RED 'Clean & Enrich' flow. Each message is a JSON object with
     at minimum: device, unit, type, location, and the sensor-specific fields
-    (contact for door sensors, occupancy for PIR sensors).
+    (contact for door sensors, occupancy/presence for PIR/presence sensors).
 
     Messages are filtered in this order:
       1. Retained messages (replayed by broker on connect) — always ignored.
@@ -301,27 +202,38 @@ def on_message(client, userdata, msg):
                 # We only act if we knew it was open — this prevents a false trigger
                 # on the first message after startup if the door is already closed.
                 state['door_open'] = False
-                print('Entrance door closed — starting observation window')
-                start_exit_window(client)
+                print('Entrance door closed — starting confirmation window')
+                sal_exit_arrival.start_exit_window(client)
 
             elif contact == False:
                 # Door has opened (contact=False = magnet separated = open).
-                # Cancel any in-progress observation window.
+                # Cancel any in-progress confirmation window.
                 state['door_open'] = True
                 print('Entrance door opened')
-                cancel_exit_window('door reopened')
+                sal_exit_arrival.cancel_exit_window('door reopened')
 
-        elif device in sal_state.PIR_SENSORS:
-            occupancy = data.get('occupancy') or data.get('presence')
-            if occupancy is True:
-                # Motion detected. Update last-seen timestamp and set IN_ROOM.
-                # Any motion always sets IN_ROOM regardless of window state.
+        elif device in sal_state.PIR_SENSORS or device in sal_state.PRESENCE_SENSORS:
+            # D20 (T-SAL2 increment 2): both PIR and presence sensors now feed
+            # the Per-Room State Model, not PIR alone — unit_appears_empty()
+            # checks presence_current across all rooms, so presence messages
+            # must update ROOM_STATE just as PIR messages do.
+            value = data.get('occupancy')
+            if value is None:
+                value = data.get('presence')
+            if value is None:
+                return  # Message carries neither field (e.g. battery update only)
+
+            sal_state.update_room_state(device, value)
+
+            if value is True:
+                # Motion/presence detected. Update last-seen timestamp (legacy
+                # field, still used by restore_legacy_state on restart) and set
+                # IN_ROOM via write_presence_status — which itself recognises
+                # ARRIVAL if this is the AWAY_INFERRED -> IN_ROOM transition.
+                # No window check here: ARRIVAL no longer depends on whether an
+                # exit confirmation window happens to be active (D20).
                 state['pir_last_seen'][device] = datetime.now(timezone.utc)
-                state['presence_status'] = sal_db.set_presence_status(UNIT, 'IN_ROOM', state['presence_status'])
-                if state['exit_window_active']:
-                    # PIR fired during observation window — someone is in the
-                    # apartment. Confirm ENTRY and cancel the window.
-                    publish_entry(client)
+                state['presence_status'] = sal_exit_arrival.write_presence_status(client, 'IN_ROOM')
 
     except Exception as e:
         print(f'on_message error: {e}')
@@ -354,7 +266,7 @@ def heartbeat_loop(client):
 def on_shutdown(signum, frame):
     """Handle graceful shutdown. Cancel any active timers before exiting."""
     print('Shutting down cleanly')
-    cancel_exit_window()
+    sal_exit_arrival.cancel_exit_window('SAL shutting down')
     sal_db.log_process_event('shutdown_clean')
     sys.exit(0)
 
@@ -379,8 +291,10 @@ sal_state.load_startup_config(UNIT)
 # Per-Room State Model (D20): build/restore from sensor_state.
 sal_state.build_room_state(UNIT)
 
-# Legacy EXIT/ENTRY state restoration (unchanged from previous version,
-# now reading from PIR_SENSORS only — see module docstring).
+# Restore door_open, pir_last_seen, and presence_status from the database
+# (sal_state.py). This is the same restart-anchor pattern used throughout
+# the system — needed because start_exit_window/write_presence_status in
+# sal_exit_arrival.py both read this state.
 sal_state.restore_legacy_state(UNIT)
 
 # Connect to EMQX. Callbacks are registered before connect() so no messages
