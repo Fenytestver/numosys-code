@@ -46,7 +46,7 @@ ENTRANCE_DOOR = '215_Entrance_Door'  # Single string — only one entrance per a
 
 # How long all PIR/presence sensors must remain silent after the door closes
 # before EXIT is confirmed. 30s is appropriate for lab use; increase for production.
-SILENCE_WINDOW_SEC = 30
+SILENCE_WINDOW_SEC = 120
 
 # Heartbeat interval. The SAL publishes a heartbeat to signal it is alive.
 # A future watchdog process will alert if the heartbeat stops arriving.
