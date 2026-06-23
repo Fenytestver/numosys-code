@@ -111,6 +111,8 @@ import paho.mqtt.client as mqtt
 import sal_db
 import sal_state
 import sal_exit_arrival
+import sal_door
+import sal_loop
 from sal_config import (
     MQTT_HOST, MQTT_PORT, MQTT_USER, MQTT_PASS,
     ENTRANCE_DOOR, UNIT, HEARTBEAT_SEC,
@@ -204,6 +206,7 @@ def on_message(client, userdata, msg):
                 state['door_open'] = False
                 print('Entrance door closed — starting confirmation window')
                 sal_exit_arrival.start_exit_window(client)
+                sal_door.on_door_closed()
 
             elif contact == False:
                 # Door has opened (contact=False = magnet separated = open).
@@ -211,6 +214,7 @@ def on_message(client, userdata, msg):
                 state['door_open'] = True
                 print('Entrance door opened')
                 sal_exit_arrival.cancel_exit_window('door reopened')
+                sal_door.on_door_opened()
 
         elif device in sal_state.PIR_SENSORS or device in sal_state.PRESENCE_SENSORS:
             # D20 (T-SAL2 increment 2): both PIR and presence sensors now feed
@@ -234,6 +238,26 @@ def on_message(client, userdata, msg):
                 # exit confirmation window happens to be active (D20).
                 state['pir_last_seen'][device] = datetime.now(timezone.utc)
                 state['presence_status'] = sal_exit_arrival.write_presence_status(client, 'IN_ROOM')
+
+            else:
+                # Sensor went False. Check for WHOLE_APARTMENT_SILENT — an
+                # immediate-red emergency that cannot wait for the 20-minute
+                # loop. Evaluated here on every False transition, costs
+                # negligible CPU. Only fires when monitoring is active.
+                if sal_db.load_monitoring_flag(UNIT):
+                    if sal_state.whole_apartment_silent_check():
+                        resident_info = sal_db.load_resident_info(UNIT)
+                        if resident_info is None:
+                            sal_db.insert_technical_alert(
+                                UNIT, 'resident_data_missing', 'orange'
+                            )
+                        else:
+                            sal_db.insert_clinical_alert(
+                                UNIT,
+                                resident_info['resident_uuid'],
+                                'whole_apartment_silent_red',
+                                'red'
+                            )
 
     except Exception as e:
         print(f'on_message error: {e}')
@@ -267,6 +291,8 @@ def on_shutdown(signum, frame):
     """Handle graceful shutdown. Cancel any active timers before exiting."""
     print('Shutting down cleanly')
     sal_exit_arrival.cancel_exit_window('SAL shutting down')
+    sal_door.on_door_closed()
+    sal_door.cancel_door_not_opened_timer('SAL shutting down')
     sal_db.log_process_event('shutdown_clean')
     sys.exit(0)
 
@@ -309,6 +335,10 @@ client.connect(MQTT_HOST, MQTT_PORT)
 # killed when the main process exits, so no explicit cleanup is needed.
 hb = threading.Thread(target=heartbeat_loop, args=[client], daemon=True)
 hb.start()
+
+# Start the 20-minute evaluation loop in a daemon thread.
+loop_thread = threading.Thread(target=sal_loop.loop_forever, daemon=True)
+loop_thread.start()
 
 print('SAL running')
 client.loop_forever()   # Hands control to paho; blocks until disconnect or signal

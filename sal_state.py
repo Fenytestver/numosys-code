@@ -256,7 +256,7 @@ def load_startup_config(unit):
     # Resident/cohort context for the fall-back resolution.
     resident_info = sal_db.load_resident_info(unit)
     resident_id = resident_info['resident_id'] if resident_info else None
-    cohort_id = resident_info['resident_uuid'] if resident_info else None
+    cohort_id = resident_info['clinical_cohort_id'] if resident_info else None
 
     # Threshold values — resolved via three-level fall-back.
     EVENT_THRESHOLDS = resolve_event_thresholds(
@@ -477,3 +477,49 @@ def restore_legacy_state(unit):
 
     state['presence_status'] = sal_db.load_current_presence_status(unit)
     print(f'Legacy state restored: {state}')
+
+
+def whole_apartment_silent_check():
+    """
+    Called from on_message after every PIR or presence sensor False
+    transition. Returns True if the whole apartment has been silent
+    beyond the WHOLE_APARTMENT_SILENT threshold, False otherwise.
+
+    'Silent' means: every room's pir_last_true AND presence_last_true are
+    both either None or older than the configured threshold for the current
+    time band. A room with presence_current=True cannot be silent by
+    definition — but presence_current is already False by the time this is
+    called (the False transition just arrived and update_room_state has
+    already applied it).
+
+    The threshold is read from EVENT_THRESHOLDS for the current time band,
+    keyed by ('WHOLE_APARTMENT_SILENT', None) — unit-scoped, no location.
+    If the key is missing (not yet configured), returns False safely.
+
+    This function is intentionally message-driven rather than loop-driven.
+    WHOLE_APARTMENT_SILENT is an immediate-red emergency condition — waiting
+    up to 20 minutes for the next loop tick is clinically unacceptable.
+    Checking on every False transition costs negligible CPU and fires within
+    seconds of the condition being established.
+    """
+    key = ('WHOLE_APARTMENT_SILENT', None)
+    if key not in EVENT_THRESHOLDS:
+        return False
+
+    band = current_time_band()
+    threshold_sec = EVENT_THRESHOLDS[key][band]['confirmation_sec']
+    now = datetime.now(timezone.utc)
+
+    for room in ROOM_STATE.values():
+        # Check PIR
+        if room['pir_last_true'] is not None:
+            elapsed = (now - room['pir_last_true']).total_seconds()
+            if elapsed < threshold_sec:
+                return False
+        # Check presence
+        if room['presence_last_true'] is not None:
+            elapsed = (now - room['presence_last_true']).total_seconds()
+            if elapsed < threshold_sec:
+                return False
+
+    return True

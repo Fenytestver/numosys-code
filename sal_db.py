@@ -207,18 +207,22 @@ def load_current_presence_status(unit):
 
 def load_resident_info(unit):
     """
-    Return {'resident_id': ..., 'resident_uuid': ..., 'mobility_classification': ...}
+    Return {'resident_id': ..., 'resident_uuid': ...,
+            'mobility_classification': ..., 'clinical_cohort_id': ...}
     for the Active resident of this unit, or None if there is no Active resident.
 
     Used to resolve the three-level fall-back (institution → cohort →
     resident) for sal_event_thresholds and time_band_definitions, and to
     evaluate the Compound EXIT block (mobility_classification).
+    clinical_cohort_id is nullable — None means no cohort assigned,
+    fall-back goes straight to tier 3.
     """
     try:
         db = get_db()
         cur = db.cursor()
         cur.execute(
-            'SELECT id, resident_uuid, mobility_classification FROM residents'
+            'SELECT id, resident_uuid, mobility_classification,'
+            ' clinical_cohort_id FROM residents'
             ' WHERE unit_id = (SELECT id FROM units WHERE unit_name = %s)'
             '   AND status = %s',
             (unit, 'Active')
@@ -230,7 +234,8 @@ def load_resident_info(unit):
         return {
             'resident_id': row[0],
             'resident_uuid': row[1],
-            'mobility_classification': row[2]
+            'mobility_classification': row[2],
+            'clinical_cohort_id': row[3],
         }
     except Exception as e:
         print(f'load_resident_info error: {e}')
@@ -344,6 +349,36 @@ def load_time_bands():
         return []
 
 
+def load_away_since(unit):
+    """
+    Return the timestamp of the most recent IN_ROOM→AWAY_INFERRED transition
+    for the Active resident of this unit, by reading the most recent
+    presence_log row where status='AWAY_INFERRED'. Returns None if no such
+    row exists (resident has never been confirmed as away, or no Active
+    resident).
+
+    Used by sal_loop.py to calculate elapsed away time for RETURN_OVERDUE.
+    """
+    try:
+        db = get_db()
+        cur = db.cursor()
+        cur.execute(
+            'SELECT pl.set_at FROM presence_log pl'
+            ' JOIN residents r ON r.id = pl.resident_id'
+            ' WHERE r.unit_id = (SELECT id FROM units WHERE unit_name = %s)'
+            '   AND r.status = %s'
+            '   AND pl.status = %s'
+            ' ORDER BY pl.set_at DESC LIMIT 1',
+            (unit, 'Active', 'AWAY_INFERRED')
+        )
+        row = cur.fetchone()
+        db.close()
+        return row[0] if row else None
+    except Exception as e:
+        print(f'load_away_since error: {e}')
+        return None
+
+
 def load_locations():
     """
     Return all active rows from locations as a list of dicts:
@@ -403,7 +438,39 @@ def load_room_sensor_state(unit):
 # not-yet-built task — these functions write to PostgreSQL only.
 # ---------------------------------------------------------------------------
 
-def insert_clinical_alert(unit, resident_uuid, reason_code, severity):
+def load_monitoring_flag(unit):
+    """
+    Return the current value of units.monitoring for this unit, or False
+    on failure (conservative default — treat as suppressed if we cannot
+    confirm monitoring is active).
+
+    Read fresh from the database on every call. This is intentional:
+    units.monitoring can be changed at any time by staff via the UI
+    (e.g. AWAY_PLANNED sets it to FALSE), with no MQTT message the SAL
+    listens to. Holding it in memory would introduce a staleness window
+    of up to one loop period — for a suppression flag, a stale TRUE means
+    the loop evaluates when it should not (low clinical risk); a stale
+    FALSE means a genuine emergency goes undetected (high clinical risk).
+    The loop runs every 20 minutes, so one DB read per tick costs nothing
+    measurable.
+    """
+    try:
+        db = get_db()
+        cur = db.cursor()
+        cur.execute(
+            'SELECT monitoring FROM units WHERE unit_name = %s',
+            (unit,)
+        )
+        row = cur.fetchone()
+        db.close()
+        return row[0] if row else False
+    except Exception as e:
+        print(f'load_monitoring_flag error: {e}')
+        return False
+
+
+def insert_clinical_alert(unit, resident_uuid, reason_code, severity,
+                          location_id=None):
     """
     Raise a new clinical alert for this unit. Looks up alert_reason_id from
     alert_reason_codes by code, then performs the required atomic
@@ -411,15 +478,40 @@ def insert_clinical_alert(unit, resident_uuid, reason_code, severity):
     clinical_alerts with the same id (see Data model > alerts >
     clinical_alerts — D17/D18).
 
+    Duplicate prevention (designed June 23, 2026): refuses to insert if an
+    alert with the same reason_code, unit, and location_id is already open.
+    The matching key is reason_code + unit_id + location_id, where
+    location_id is NULL for unit-scoped alerts and carries the specific room
+    for room-scoped alerts (STATIONARY_PRESENCE). This protects every
+    call site automatically — no per-event duplicate check needed.
+
     generated_by is always 'situational' here — these are SAL-raised
     alerts, not Bayesian. bayesian_probability is left NULL, per schema
     (NULL for situational alerts).
 
-    Returns the new alert id, or None on failure.
+    Returns the new alert id, or None on failure or duplicate.
     """
     try:
         db = get_db()
         cur = db.cursor()
+
+        # Dedup check: refuse if an open alert with the same key already exists.
+        cur.execute(
+            'SELECT a.id FROM alerts a'
+            ' JOIN clinical_alerts ca ON ca.id = a.id'
+            ' JOIN alert_reason_codes arc ON arc.id = a.alert_reason_id'
+            ' WHERE ca.unit_id = (SELECT id FROM units WHERE unit_name = %s)'
+            '   AND arc.code = %s'
+            '   AND a.status = %s'
+            '   AND (ca.location_id = %s OR (ca.location_id IS NULL AND %s IS NULL))',
+            (unit, reason_code, 'open', location_id, location_id)
+        )
+        if cur.fetchone():
+            print(f'insert_clinical_alert: duplicate suppressed — '
+                  f'{reason_code} already open for unit {unit} location {location_id}')
+            db.close()
+            return None
+
         cur.execute(
             'SELECT id FROM alert_reason_codes WHERE code = %s',
             (reason_code,)
@@ -440,9 +532,9 @@ def insert_clinical_alert(unit, resident_uuid, reason_code, severity):
 
         cur.execute(
             'INSERT INTO clinical_alerts'
-            ' (id, resident_uuid, unit_id, bayesian_probability, generated_by)'
-            ' VALUES (%s, %s, (SELECT id FROM units WHERE unit_name = %s), NULL, %s)',
-            (alert_id, resident_uuid, unit, 'situational')
+            ' (id, resident_uuid, unit_id, location_id, bayesian_probability, generated_by)'
+            ' VALUES (%s, %s, (SELECT id FROM units WHERE unit_name = %s), %s, NULL, %s)',
+            (alert_id, resident_uuid, unit, location_id, 'situational')
         )
 
         db.commit()
