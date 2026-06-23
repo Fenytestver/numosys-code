@@ -480,28 +480,6 @@ def restore_legacy_state(unit):
 
 
 def whole_apartment_silent_check():
-    """
-    Called from on_message after every PIR or presence sensor False
-    transition. Returns True if the whole apartment has been silent
-    beyond the WHOLE_APARTMENT_SILENT threshold, False otherwise.
-
-    'Silent' means: every room's pir_last_true AND presence_last_true are
-    both either None or older than the configured threshold for the current
-    time band. A room with presence_current=True cannot be silent by
-    definition — but presence_current is already False by the time this is
-    called (the False transition just arrived and update_room_state has
-    already applied it).
-
-    The threshold is read from EVENT_THRESHOLDS for the current time band,
-    keyed by ('WHOLE_APARTMENT_SILENT', None) — unit-scoped, no location.
-    If the key is missing (not yet configured), returns False safely.
-
-    This function is intentionally message-driven rather than loop-driven.
-    WHOLE_APARTMENT_SILENT is an immediate-red emergency condition — waiting
-    up to 20 minutes for the next loop tick is clinically unacceptable.
-    Checking on every False transition costs negligible CPU and fires within
-    seconds of the condition being established.
-    """
     key = ('WHOLE_APARTMENT_SILENT', None)
     if key not in EVENT_THRESHOLDS:
         return False
@@ -509,6 +487,8 @@ def whole_apartment_silent_check():
     band = current_time_band()
     threshold_sec = EVENT_THRESHOLDS[key][band]['red_sec']
     now = datetime.now(timezone.utc)
+
+    print(f'whole_apartment_silent_check running, threshold={threshold_sec}s, ROOM_STATE={ROOM_STATE}')
 
     for room in ROOM_STATE.values():
         # Check PIR
@@ -522,4 +502,5 @@ def whole_apartment_silent_check():
             if elapsed < threshold_sec:
                 return False
 
+    print('whole_apartment_silent_check: SILENT — firing alert')
     return True
