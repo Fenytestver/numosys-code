@@ -185,6 +185,8 @@ def _loop_tick():
         print('Loop tick: monitoring inactive — skipped')
         return
 
+    print(f'Loop tick: monitoring active, presence={state["presence_status"]}')
+
     # Band transition: detect morning band start for DOOR_NOT_OPENED.
     current_band = sal_state.current_time_band()
     if current_band == 'morning' and _last_band != 'morning':
