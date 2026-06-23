@@ -507,7 +507,7 @@ def whole_apartment_silent_check():
         return False
 
     band = current_time_band()
-    threshold_sec = EVENT_THRESHOLDS[key][band]['confirmation_sec']
+    threshold_sec = EVENT_THRESHOLDS[key][band]['red_sec']
     now = datetime.now(timezone.utc)
 
     for room in ROOM_STATE.values():

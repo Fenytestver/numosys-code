@@ -86,7 +86,7 @@ def on_door_opened():
         print('DOOR_LEFT_OPEN: no threshold configured — timer not started')
         return
 
-    threshold_sec = sal_state.EVENT_THRESHOLDS[key][band]['confirmation_sec']
+    threshold_sec = sal_state.EVENT_THRESHOLDS[key][band]['yellow_sec']
     print(f'DOOR_LEFT_OPEN timer started — {threshold_sec}s')
     _door_left_open_timer = threading.Timer(
         threshold_sec, _fire_door_left_open
@@ -156,7 +156,7 @@ def start_door_not_opened_timer():
         return
 
     band = sal_state.current_time_band()
-    threshold_sec = sal_state.EVENT_THRESHOLDS[key][band]['confirmation_sec']
+    threshold_sec = sal_state.EVENT_THRESHOLDS[key][band]['yellow_sec']
     print(f'DOOR_NOT_OPENED timer started — {threshold_sec}s')
     _door_not_opened_timer = threading.Timer(
         threshold_sec, _fire_door_not_opened
