@@ -256,7 +256,7 @@ def load_startup_config(unit):
     # Resident/cohort context for the fall-back resolution.
     resident_info = sal_db.load_resident_info(unit)
     resident_id = resident_info['resident_id'] if resident_info else None
-    cohort_id = resident_info['cohort_id'] if resident_info else None
+    cohort_id = resident_info['resident_uuid'] if resident_info else None
 
     # Threshold values — resolved via three-level fall-back.
     EVENT_THRESHOLDS = resolve_event_thresholds(

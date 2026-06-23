@@ -200,7 +200,7 @@ def confirm_exit(client):
 def evaluate_compound_exit():
     """
     Run immediately after EXIT confirms. Looks up the unit's Active
-    resident (mobility_classification, cohort_id) and the current time
+    resident (mobility_classification, resident_uuid) and the current time
     band, then applies the priority-ordered rule:
 
       1. Immobile                                  -> red   (IMMOBILE_RESIDENT_EXIT)
@@ -226,15 +226,15 @@ def evaluate_compound_exit():
         return
 
     mobility = resident_info['mobility_classification']
-    cohort_id = resident_info['cohort_id']
+    resident_uuid = resident_info['resident_uuid']
     band = sal_state.current_time_band()
     is_night = (band == 'night')
 
     if mobility == 'Immobile':
-        sal_db.insert_clinical_alert(UNIT, cohort_id, 'immobile_resident_exit_red', 'red')
+        sal_db.insert_clinical_alert(UNIT, resident_uuid, 'immobile_resident_exit_red', 'red')
     elif mobility == 'Mobile_with_assistance' and is_night:
-        sal_db.insert_clinical_alert(UNIT, cohort_id, 'mobile_with_assistance_night_exit_orange', 'orange')
+        sal_db.insert_clinical_alert(UNIT, resident_uuid, 'mobile_with_assistance_night_exit_orange', 'orange')
     elif is_night:
-        sal_db.insert_clinical_alert(UNIT, cohort_id, 'night_exit_yellow', 'yellow')
+        sal_db.insert_clinical_alert(UNIT, resident_uuid, 'night_exit_yellow', 'yellow')
     else:
         print('Compound EXIT evaluation: no alert condition met')

@@ -207,7 +207,7 @@ def load_current_presence_status(unit):
 
 def load_resident_info(unit):
     """
-    Return {'resident_id': ..., 'cohort_id': ..., 'mobility_classification': ...}
+    Return {'resident_id': ..., 'resident_uuid': ..., 'mobility_classification': ...}
     for the Active resident of this unit, or None if there is no Active resident.
 
     Used to resolve the three-level fall-back (institution → cohort →
@@ -218,7 +218,7 @@ def load_resident_info(unit):
         db = get_db()
         cur = db.cursor()
         cur.execute(
-            'SELECT id, cohort_id, mobility_classification FROM residents'
+            'SELECT id, resident_uuid, mobility_classification FROM residents'
             ' WHERE unit_id = (SELECT id FROM units WHERE unit_name = %s)'
             '   AND status = %s',
             (unit, 'Active')
@@ -229,7 +229,7 @@ def load_resident_info(unit):
             return None
         return {
             'resident_id': row[0],
-            'cohort_id': row[1],
+            'resident_uuid': row[1],
             'mobility_classification': row[2]
         }
     except Exception as e:
@@ -403,7 +403,7 @@ def load_room_sensor_state(unit):
 # not-yet-built task — these functions write to PostgreSQL only.
 # ---------------------------------------------------------------------------
 
-def insert_clinical_alert(unit, cohort_id, reason_code, severity):
+def insert_clinical_alert(unit, resident_uuid, reason_code, severity):
     """
     Raise a new clinical alert for this unit. Looks up alert_reason_id from
     alert_reason_codes by code, then performs the required atomic
@@ -440,9 +440,9 @@ def insert_clinical_alert(unit, cohort_id, reason_code, severity):
 
         cur.execute(
             'INSERT INTO clinical_alerts'
-            ' (id, cohort_id, unit_id, bayesian_probability, generated_by)'
+            ' (id, resident_uuid, unit_id, bayesian_probability, generated_by)'
             ' VALUES (%s, %s, (SELECT id FROM units WHERE unit_name = %s), NULL, %s)',
-            (alert_id, cohort_id, unit, 'situational')
+            (alert_id, resident_uuid, unit, 'situational')
         )
 
         db.commit()
