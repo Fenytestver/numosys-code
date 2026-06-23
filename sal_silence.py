@@ -60,6 +60,10 @@ def on_false_message():
     if _silence_timer is not None:
         return  # Timer already running — condition already detected
 
+    # Don't restart the cycle if the alert is already open.
+    if sal_db.find_open_alerts(UNIT, ['whole_apartment_silent_red']):
+        return
+
     key = ('WHOLE_APARTMENT_SILENT', None)
     if key not in sal_state.EVENT_THRESHOLDS:
         print('WHOLE_APARTMENT_SILENT: no threshold configured — timer not started')
