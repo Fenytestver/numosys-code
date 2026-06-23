@@ -63,7 +63,7 @@ from sal_config import UNIT
 from sal_state import state
 
 
-LOOP_PERIOD_SEC = 1200   # 20 minutes
+LOOP_PERIOD_SEC = 30   # temporary test — revert to 1200 after testing
 
 
 # ---------------------------------------------------------------------------
