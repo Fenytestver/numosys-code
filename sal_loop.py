@@ -63,7 +63,7 @@ from sal_config import UNIT
 from sal_state import state
 
 
-LOOP_PERIOD_SEC = 30   # temporary test — revert to 1200 after testing
+LOOP_PERIOD_SEC = 1200   # 20 minutes
 
 
 # ---------------------------------------------------------------------------
@@ -184,8 +184,6 @@ def _loop_tick():
     if not sal_db.load_monitoring_flag(UNIT):
         print('Loop tick: monitoring inactive — skipped')
         return
-
-    print(f'Loop tick: monitoring active, presence={state["presence_status"]}')
 
     # Band transition: detect morning band start for DOOR_NOT_OPENED.
     current_band = sal_state.current_time_band()
