@@ -77,26 +77,22 @@ def on_true_message():
     Called from sal.py on_message after every PIR/presence True message,
     after update_unit_states has run.
 
-    If unit_silent is now False (just cleared by update_unit_states), cancel
-    the confirmation timer and auto-clear any open alert.
-    If unit_silent is still True (shouldn't happen — a True message always
-    clears it), do nothing.
+    Always cancels the confirmation timer if one is running, and auto-clears
+    any open alert. Does not check unit_silent — by the time this is called,
+    update_unit_states has already set unit_silent to False. The timer
+    running is itself the signal that cancellation is needed.
     """
     global _silence_timer
-
-    if sal_state.unit_silent:
-        return  # Still silent — nothing to cancel
 
     if _silence_timer is not None:
         _silence_timer.cancel()
         _silence_timer = None
         print('WHOLE_APARTMENT_SILENT: presence detected — timer cancelled')
 
-    # Auto-clear any open WHOLE_APARTMENT_SILENT alert.
-    open_alerts = sal_db.find_open_alerts(UNIT, 'whole_apartment_silent_red')
-    for alert_id in open_alerts:
-        sal_db.auto_clear_alert(alert_id, 'system:SAL — presence detected')
-        print(f'WHOLE_APARTMENT_SILENT: auto-cleared alert {alert_id}')
+    open_alerts = sal_db.find_open_alerts(UNIT, ['whole_apartment_silent_red'])
+    for row in open_alerts:
+        sal_db.auto_clear_alert(row['alert_id'])
+        print(f'WHOLE_APARTMENT_SILENT: auto-cleared alert {row["alert_id"]}')
 
 
 def _fire_alert():
