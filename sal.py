@@ -217,6 +217,7 @@ def on_message(client, userdata, msg):
                 sal_door.on_door_opened()
 
         elif device in sal_state.PIR_SENSORS or device in sal_state.PRESENCE_SENSORS:
+            print(f'Sensor message: device={device}, data={data}')
             # D20 (T-SAL2 increment 2): both PIR and presence sensors now feed
             # the Per-Room State Model, not PIR alone — unit_appears_empty()
             # checks presence_current across all rooms, so presence messages
