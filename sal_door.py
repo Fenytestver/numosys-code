@@ -87,6 +87,10 @@ def on_door_opened():
 
     cancel_door_not_opened_timer('door opened')
 
+    open_alerts = sal_db.find_open_alerts(UNIT, ['door_not_opened_yellow'])
+    for alert in open_alerts:
+        sal_db.auto_clear_alert(alert['alert_id'])
+
     if _door_left_open_timer is not None:
         return  # Timer already running — door was already open
 
@@ -121,6 +125,10 @@ def on_door_closed():
         _door_left_open_timer.cancel()
         _door_left_open_timer = None
         print('DOOR_LEFT_OPEN timer cancelled — door closed')
+
+    open_alerts = sal_db.find_open_alerts(UNIT, ['door_left_open_yellow'])
+    for alert in open_alerts:
+        sal_db.auto_clear_alert(alert['alert_id'])
 
     if _daytime_window_active:
         _start_door_not_opened_timer()
