@@ -10,16 +10,27 @@ DOOR_LEFT_OPEN
     Mechanism: a single countdown timer starts. If the door is still open
                when the timer expires, a clinical alert is raised.
     Cancel  : door closes (contact=True) before the timer fires.
-    Alert   : door_left_open_yellow (single tier — no escalation chain).
+    Alert   : door_left_open_yellow (single tier — yellow only).
 
 DOOR_NOT_OPENED
-    Trigger : morning time band starts (called from sal_loop.py at the
-              first loop tick after the band begins).
-    Mechanism: a single countdown timer starts. If the door has not opened
-               before the timer fires, a clinical alert is raised.
-    Cancel  : door opens during the countdown — normal morning activity.
-    Reset   : fires once per day. After the alert fires or the door opens,
-              the timer is not restarted until the next morning band.
+    Trigger : sal_loop.py starts the timer at the night→day band transition.
+              sal_loop.py cancels the timer at the day→night transition.
+    Mechanism: while the daytime window is active, every door-close starts
+               a countdown. If the door does not open again before the timer
+               fires, a clinical alert is raised. Every door-open cancels the
+               countdown; every subsequent door-close restarts it — so a nurse
+               visit resets the clock, and the resident is monitored throughout
+               the day, not just from morning start.
+    Cancel  : door opens (contact=False) during the countdown.
+    Night   : sal_loop cancels any running timer at the day→night transition.
+              Door-close events during night band are ignored for this event.
+    Alert   : door_not_opened_yellow (single tier — yellow only).
+
+Boundary responsibility:
+    sal_loop  — owns the day/night boundary: starts at night→day transition,
+                cancels at day→night transition.
+    sal_door  — owns what happens while the daytime window is active: cancels
+                on door-open, restarts on door-close.
 
 Both timers use threading.Timer (same pattern as the EXIT confirmation
 window in sal_exit_arrival.py). Both are single-timer-chain events —
@@ -36,7 +47,6 @@ rest of the SAL.
 
 import threading
 from datetime import datetime, timezone
-import json
 
 import sal_db
 import sal_state
@@ -51,10 +61,10 @@ from sal_config import UNIT
 _door_left_open_timer = None
 _door_not_opened_timer = None
 
-# Tracks whether the door has opened during the current day's morning band.
-# Set to True by on_door_opened(); reset to False by start_door_not_opened_timer()
-# at the start of each new morning band.
-_door_opened_this_morning = False
+# Set to True by sal_loop when the daytime window is active (night→day
+# transition). Set to False at day→night transition. sal_door uses this
+# to decide whether to start a DOOR_NOT_OPENED countdown on door-close.
+_daytime_window_active = False
 
 
 # ---------------------------------------------------------------------------
@@ -69,12 +79,12 @@ def on_door_opened():
     (door opened twice without closing — shouldn't happen in practice but
     guarded against), the existing timer continues unchanged.
 
-    Also records that the door has opened this morning, cancelling any
-    DOOR_NOT_OPENED countdown that may be running.
+    Also cancels any running DOOR_NOT_OPENED countdown — the door has opened,
+    which is exactly the normal daytime activity the timer was waiting for.
+    The next door-close will restart the DOOR_NOT_OPENED countdown.
     """
-    global _door_left_open_timer, _door_opened_this_morning
+    global _door_left_open_timer
 
-    _door_opened_this_morning = True
     cancel_door_not_opened_timer('door opened')
 
     if _door_left_open_timer is not None:
@@ -97,7 +107,13 @@ def on_door_opened():
 def on_door_closed():
     """
     Called by sal.py on_message when the entrance door closes (contact=True).
+
     Cancels the DOOR_LEFT_OPEN timer — door closed before it fired.
+
+    Also starts the DOOR_NOT_OPENED countdown if the daytime window is active
+    (sal_loop has signalled that we are in a non-night band). If the daytime
+    window is not active (night band), the door-close is ignored for
+    DOOR_NOT_OPENED purposes.
     """
     global _door_left_open_timer
 
@@ -105,6 +121,9 @@ def on_door_closed():
         _door_left_open_timer.cancel()
         _door_left_open_timer = None
         print('DOOR_LEFT_OPEN timer cancelled — door closed')
+
+    if _daytime_window_active:
+        _start_door_not_opened_timer()
 
 
 def _fire_door_left_open():
@@ -134,18 +153,37 @@ def _fire_door_left_open():
 # DOOR_NOT_OPENED
 # ---------------------------------------------------------------------------
 
-def start_door_not_opened_timer():
+def start_daytime_window():
     """
-    Called by sal_loop.py at the first loop tick after the morning time band
-    begins. Starts the DOOR_NOT_OPENED countdown. If a timer is already
-    running from a previous call (loop ticked twice in the morning band
-    before the door opened), the existing timer continues unchanged.
-
-    Resets _door_opened_this_morning to False — a new morning band begins.
+    Called by sal_loop.py at the night→day band transition.
+    Activates the daytime monitoring window and starts the DOOR_NOT_OPENED
+    countdown — the door has not opened yet since daytime began.
     """
-    global _door_not_opened_timer, _door_opened_this_morning
+    global _daytime_window_active
+    _daytime_window_active = True
+    print('DOOR_NOT_OPENED: daytime window started')
+    _start_door_not_opened_timer()
 
-    _door_opened_this_morning = False
+
+def end_daytime_window():
+    """
+    Called by sal_loop.py at the day→night band transition.
+    Deactivates the daytime monitoring window and cancels any running
+    DOOR_NOT_OPENED countdown — night band, no monitoring needed.
+    """
+    global _daytime_window_active
+    _daytime_window_active = False
+    cancel_door_not_opened_timer('night band started')
+
+
+def _start_door_not_opened_timer():
+    """
+    Internal. Start the DOOR_NOT_OPENED countdown using the current band's
+    threshold. If a timer is already running, it continues unchanged — this
+    guards against the loop ticking twice in the same band before the door
+    opens.
+    """
+    global _door_not_opened_timer
 
     if _door_not_opened_timer is not None:
         return  # Already running
@@ -166,8 +204,9 @@ def start_door_not_opened_timer():
 
 def cancel_door_not_opened_timer(reason='door opened'):
     """
-    Cancel the DOOR_NOT_OPENED timer. Called when the door opens during
-    the morning countdown — normal morning activity, no alert needed.
+    Cancel the DOOR_NOT_OPENED timer. Called when the door opens (normal
+    daytime activity) or when the night band starts (sal_loop boundary).
+    Safe to call when no timer is running.
     """
     global _door_not_opened_timer
 
@@ -180,7 +219,7 @@ def cancel_door_not_opened_timer(reason='door opened'):
 def _fire_door_not_opened():
     """
     Called when the DOOR_NOT_OPENED timer expires. The door has not opened
-    since the morning band started. Raises the clinical alert.
+    within the threshold period. Raises the clinical alert.
     """
     global _door_not_opened_timer
     _door_not_opened_timer = None

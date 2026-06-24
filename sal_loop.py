@@ -18,10 +18,11 @@ the following events:
                          transition exceeds the threshold, the resident has
                          not returned. Two-tier: yellow then orange.
 
-  DOOR_NOT_OPENED      — the morning-band countdown is started here at the
-                         first tick after the morning time band begins.
-                         The actual alert is raised by sal_door.py when its
-                         timer fires; this loop only starts the timer.
+  DOOR_NOT_OPENED      — the loop signals the day/night boundary to sal_door:
+                         start_daytime_window() at night→day transition,
+                         end_daytime_window() at day→night transition.
+                         sal_door owns the timer mechanics; the loop owns
+                         the boundary detection.
 
 WHOLE_APARTMENT_SILENT is intentionally NOT evaluated here. It is an
 immediate-red emergency condition — waiting up to 20 minutes for the next
@@ -68,8 +69,8 @@ LOOP_PERIOD_SEC = 1200   # 20 minutes
 
 # ---------------------------------------------------------------------------
 # BAND TRANSITION TRACKING
-# Used to detect when the morning band starts, so the DOOR_NOT_OPENED
-# timer is started exactly once per day.
+# Used to detect day/night boundary crossings for DOOR_NOT_OPENED.
+# sal_door owns the timer mechanics; sal_loop owns the boundary signals.
 # ---------------------------------------------------------------------------
 
 _last_band = None
@@ -185,10 +186,12 @@ def _loop_tick():
         print('Loop tick: monitoring inactive — skipped')
         return
 
-    # Band transition: detect morning band start for DOOR_NOT_OPENED.
+    # Band transition: signal day/night boundary to sal_door for DOOR_NOT_OPENED.
     current_band = sal_state.current_time_band()
-    if current_band == 'morning' and _last_band != 'morning':
-        sal_door.start_door_not_opened_timer()
+    if current_band != 'night' and _last_band == 'night':
+        sal_door.start_daytime_window()
+    elif current_band == 'night' and _last_band != 'night' and _last_band is not None:
+        sal_door.end_daytime_window()
     _last_band = current_band
 
     # Resident info needed for all alert-raising calls.
