@@ -194,6 +194,16 @@ def _loop_tick():
         sal_door.end_daytime_window()
     _last_band = current_band
 
+    # Gate 2: unit in manual mode (Sensor Availability, T-SAL2 increment 4)?
+    # Manual mode blocks new alert evaluation entirely for this tick. The
+    # day/night boundary signalling above still runs — it's bookkeeping,
+    # not clinical evaluation, and sal_door's own timer starts are gated
+    # separately. See sal_availability.py.
+    import sal_availability
+    if sal_availability.unit_manual_mode:
+        print('Loop tick: unit in manual mode — skipping event evaluation')
+        return
+
     # Resident info needed for all alert-raising calls.
     resident_info = sal_db.load_resident_info(UNIT)
     if resident_info is None:
@@ -202,11 +212,11 @@ def _loop_tick():
 
     presence_status = state['presence_status']
 
-    # Gate 2 (per event): STATIONARY_PRESENCE only when IN_ROOM.
+    # Gate 3 (per event): STATIONARY_PRESENCE only when IN_ROOM.
     if presence_status == 'IN_ROOM':
         _evaluate_stationary_presence(resident_info)
 
-    # Gate 2 (per event): RETURN_OVERDUE only when AWAY_INFERRED.
+    # Gate 3 (per event): RETURN_OVERDUE only when AWAY_INFERRED.
     if presence_status == 'AWAY_INFERRED':
         _evaluate_return_overdue(resident_info)
 

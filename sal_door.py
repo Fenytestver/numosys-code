@@ -82,6 +82,12 @@ def on_door_opened():
     Also cancels any running DOOR_NOT_OPENED countdown — the door has opened,
     which is exactly the normal daytime activity the timer was waiting for.
     The next door-close will restart the DOOR_NOT_OPENED countdown.
+
+    The cancel and auto-clear above always run, even in manual mode — they
+    resolve facts already on record, not new clinical evaluation. Only the
+    new DOOR_LEFT_OPEN timer start below is skipped while the unit is in
+    manual mode (Sensor Availability, T-SAL2 increment 4). See
+    sal_availability.py.
     """
     global _door_left_open_timer
 
@@ -91,9 +97,13 @@ def on_door_opened():
     for alert in open_alerts:
         sal_db.auto_clear_alert(alert['alert_id'])
 
+    import sal_availability
+    if sal_availability.unit_manual_mode:
+        return  # Manual mode — DOOR_LEFT_OPEN timer not started
+
     if _door_left_open_timer is not None:
         return  # Timer already running — door was already open
-
+    
     band = sal_state.current_time_band()
     key = ('DOOR_LEFT_OPEN', None)
     if key not in sal_state.EVENT_THRESHOLDS:
@@ -121,10 +131,7 @@ def on_door_closed():
     """
     global _door_left_open_timer
 
-    if _door_left_open_timer is not None:
-        _door_left_open_timer.cancel()
-        _door_left_open_timer = None
-        print('DOOR_LEFT_OPEN timer cancelled — door closed')
+    cancel_door_left_open_timer('door closed')
 
     open_alerts = sal_db.find_open_alerts(UNIT, ['door_left_open_yellow'])
     for alert in open_alerts:
@@ -156,6 +163,16 @@ def _fire_door_left_open():
         'yellow'
     )
 
+def cancel_door_left_open_timer(reason='door closed'):
+    """
+    Cancel the DOOR_LEFT_OPEN timer. Safe to call when no timer is running.
+    """
+    global _door_left_open_timer
+
+    if _door_left_open_timer is not None:
+        _door_left_open_timer.cancel()
+        _door_left_open_timer = None
+        print(f'DOOR_LEFT_OPEN timer cancelled — {reason}')
 
 # ---------------------------------------------------------------------------
 # DOOR_NOT_OPENED
@@ -190,8 +207,17 @@ def _start_door_not_opened_timer():
     threshold. If a timer is already running, it continues unchanged — this
     guards against the loop ticking twice in the same band before the door
     opens.
+
+    Skipped entirely while the unit is in manual mode (Sensor Availability,
+    T-SAL2 increment 4) — manual mode blocks new timer starts. Gating here
+    covers both call sites (start_daytime_window and on_door_closed). See
+    sal_availability.py.
     """
     global _door_not_opened_timer
+
+    import sal_availability
+    if sal_availability.unit_manual_mode:
+        return  # Manual mode — timer not started
 
     if _door_not_opened_timer is not None:
         return  # Already running

@@ -131,9 +131,19 @@ def start_exit_window(client):
     Recognition Detail. Not changed in this increment; the window
     duration source is a separate, later concern from the confirmation
     *logic* itself.
+
+    Skipped entirely while the unit is in manual mode (Sensor Availability,
+    T-SAL2 increment 4) — manual mode blocks new timer starts. EXIT itself
+    will not be confirmed or published while the unit is in manual mode.
+    See sal_availability.py.
     """
+    import sal_availability
+    if sal_availability.unit_manual_mode:
+        return
+
     if state['exit_window_active']:
         return
+    
     print(f'EXIT window started — {SILENCE_WINDOW_SEC}s')
     state['exit_window_active'] = True
     t = threading.Timer(SILENCE_WINDOW_SEC, confirm_exit, args=[client])

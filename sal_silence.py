@@ -51,8 +51,16 @@ def on_false_message():
 
     Checks unit_silent. If True and no timer is running, starts the
     confirmation timer. If unit_silent is False, does nothing.
+
+    Skipped entirely while the unit is in manual mode (Sensor Availability,
+    T-SAL2 increment 4) — manual mode blocks new timer starts. See
+    sal_availability.py.
     """
     global _silence_timer
+
+    import sal_availability
+    if sal_availability.unit_manual_mode:
+        return
 
     if not sal_state.unit_silent:
         return  # At least one room still occupied — nothing to do

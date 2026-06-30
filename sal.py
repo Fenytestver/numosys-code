@@ -114,6 +114,7 @@ import sal_exit_arrival
 import sal_door
 import sal_loop
 import sal_silence
+import sal_availability
 from sal_config import (
     MQTT_HOST, MQTT_PORT, MQTT_USER, MQTT_PASS,
     ENTRANCE_DOOR, UNIT, HEARTBEAT_SEC,
@@ -156,18 +157,27 @@ def on_connect(client, userdata, flags, reason_code, properties):
     """
     print(f'MQTT connected: {reason_code}')
     client.subscribe('zigbee2mqtt/clean')
+    client.subscribe('nomusys/availability/+')
 
 
 def on_message(client, userdata, msg):
     """
-    Called by the MQTT library for every message on zigbee2mqtt/clean.
+    Called by the MQTT library for every message on zigbee2mqtt/clean and
+    nomusys/availability/+.
 
     The clean topic carries enriched, normalised sensor messages published by
     the Node-RED 'Clean & Enrich' flow. Each message is a JSON object with
     at minimum: device, unit, type, location, and the sensor-specific fields
     (contact for door sensors, occupancy/presence for PIR/presence sensors).
 
-    Messages are filtered in this order:
+    The availability topic (T-SAL2 increment 4) carries one fact per sensor
+    — {"device": ..., "available": bool} — published by Node-RED from Z2M's
+    availability feature. Handled in a separate branch at the top of this
+    function, before any of the zigbee2mqtt/clean filtering below, since the
+    payload shape and retain-message handling are both different. See
+    sal_availability.py.
+
+    Messages on zigbee2mqtt/clean are filtered in this order:
       1. Retained messages (replayed by broker on connect) — always ignored.
          These represent the last known state, not a new event.
       2. Messages timestamped before SAL startup — ignored as stale.
@@ -180,6 +190,19 @@ def on_message(client, userdata, msg):
       contact=False → door OPEN   (magnet separated)
     """
     try:
+        # Branch: Sensor Availability messages (T-SAL2 increment 4) — separate
+        # topic, separate payload shape, handled entirely by sal_availability.
+        # Retained messages on this topic are NOT discarded — the retained
+        # message is exactly what tells the SAL the current availability
+        # state on startup/reconnect.
+        if msg.topic.startswith('nomusys/availability/'):
+            data = json.loads(msg.payload)
+            device = data.get('device')
+            available = data.get('available')
+            if device is not None and available is not None:
+                sal_availability.on_availability_message(device, available)
+            return
+
         data = json.loads(msg.payload)
 
         # Filter 1: discard retained messages replayed by the broker on connect
